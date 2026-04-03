@@ -949,6 +949,29 @@ async function start() {
         return handleCookiePickerRoute(url, req, browserManager, AUTH_TOKEN);
       }
 
+      // Welcome page — served when GStack Browser launches in headed mode
+      if (url.pathname === '/welcome') {
+        const welcomePath = (() => {
+          // Check project-local designs first, then global
+          const slug = process.env.GSTACK_SLUG || 'unknown';
+          const projectWelcome = `${process.env.HOME}/.gstack/projects/${slug}/designs/welcome-page-20260331/finalized.html`;
+          try { if (require('fs').existsSync(projectWelcome)) return projectWelcome; } catch {}
+          // Fallback: built-in welcome page from gstack install
+          const skillRoot = process.env.GSTACK_SKILL_ROOT || `${process.env.HOME}/.claude/skills/gstack`;
+          const builtinWelcome = `${skillRoot}/browse/src/welcome.html`;
+          try { if (require('fs').existsSync(builtinWelcome)) return builtinWelcome; } catch {}
+          return null;
+        })();
+        if (welcomePath) {
+          try {
+            const html = require('fs').readFileSync(welcomePath, 'utf-8');
+            return new Response(html, { headers: { 'Content-Type': 'text/html; charset=utf-8' } });
+          } catch {}
+        }
+        // No welcome page found — redirect to about:blank
+        return new Response('', { status: 302, headers: { 'Location': 'about:blank' } });
+      }
+
       // Health check — no auth required, does NOT reset idle timer
       if (url.pathname === '/health') {
         const healthy = await browserManager.isHealthy();
@@ -1493,6 +1516,17 @@ async function start() {
   fs.renameSync(tmpFile, config.stateFile);
 
   browserManager.serverPort = port;
+
+  // Navigate to welcome page if in headed mode and still on about:blank
+  if (browserManager.getConnectionMode() === 'headed') {
+    try {
+      const currentUrl = browserManager.getCurrentUrl();
+      if (currentUrl === 'about:blank' || currentUrl === '') {
+        const page = browserManager.getPage();
+        page.goto(`http://127.0.0.1:${port}/welcome`, { timeout: 3000 }).catch(() => {});
+      }
+    } catch {}
+  }
 
   // Clean up stale state files (older than 7 days)
   try {
