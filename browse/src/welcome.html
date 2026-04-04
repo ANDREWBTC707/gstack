@@ -37,7 +37,7 @@
     background-image: url("data:image/svg+xml,%3Csvg viewBox='0 0 256 256' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.85' numOctaves='4' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)'/%3E%3C/svg%3E");
     background-size: 128px 128px;
   }
-  .page { width: 100%; max-width: 860px; padding: 0 40px; }
+  .page { width: 100%; max-width: 1060px; padding: 0 40px; }
 
   /* Sidebar prompt — points RIGHT toward where sidebar opens */
   .sidebar-prompt {
@@ -87,8 +87,8 @@
   .logo-text { font-family: 'Satoshi', sans-serif; font-weight: 900; font-size: 28px; color: #fff; letter-spacing: -0.5px; }
   .tagline { font-size: 15px; color: var(--zinc-400); max-width: 560px; line-height: 1.6; }
 
-  /* Feature cards */
-  .features { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; margin-bottom: 28px; }
+  /* Feature cards — 3 columns for 6 cards */
+  .features { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 14px; margin-bottom: 28px; }
   .feat {
     background: var(--surface);
     border: 1px solid var(--border);
@@ -155,7 +155,10 @@
   .footer a { color: var(--zinc-400); text-decoration: none; }
   .footer a:hover { color: var(--amber-400); }
 
-  @media (max-width: 700px) {
+  @media (max-width: 900px) {
+    .features { grid-template-columns: 1fr 1fr; }
+  }
+  @media (max-width: 600px) {
     .features { grid-template-columns: 1fr; }
     html, body { overflow: auto; }
     .sidebar-prompt { right: 40px; }
@@ -181,19 +184,27 @@
   <div class="features">
     <div class="feat">
       <div class="feat-title">Talk to the sidebar</div>
-      <p>The sidebar chat is a Claude instance that <span class="hl">controls this browser</span>. Say "go to my app and check if login works" and watch it navigate, click, fill forms, and report back. It sees the same page you do.</p>
+      <p>The sidebar chat is a Claude instance that <span class="hl">controls this browser</span>. Say "go to my app and check if login works" and watch it navigate, click, fill forms, and report back.</p>
+    </div>
+    <div class="feat">
+      <div class="feat-title">Or use your main agent</div>
+      <p>Your Claude Code terminal <span class="hl">also controls this browser</span>. Run <code>/qa</code>, <code>/design-review</code>, or any skill and watch every action happen here. Two agents, one browser.</p>
+    </div>
+    <div class="feat">
+      <div class="feat-title">Import your cookies</div>
+      <p>Click <span class="hl">🍪 Cookies</span> in the sidebar to import login sessions from Chrome, Arc, or Brave. Browse authenticated pages <span class="hl">without logging in again</span>.</p>
     </div>
     <div class="feat">
       <div class="feat-title">Clean up any page</div>
-      <p>Click the <span class="hl">Cleanup</span> button in the sidebar. An AI reads the page, identifies overlays, paywalls, cookie banners, and clutter, then <span class="hl">removes them</span>. Articles become readable. Works on news sites, docs, anything.</p>
+      <p>Click <span class="hl">Cleanup</span> in the sidebar. AI identifies overlays, paywalls, cookie banners, and clutter, then <span class="hl">removes them</span>. Articles become readable.</p>
     </div>
     <div class="feat">
       <div class="feat-title">Smart screenshots</div>
-      <p>The <code>screenshot</code> button captures a <span class="hl">cleaned, annotated screenshot</span> and sends it to your Claude Code session as context. "What's wrong with this page?" now has a visual answer.</p>
+      <p>The <span class="hl">Screenshot</span> button captures a cleaned screenshot and sends it to your Claude Code session as context. "What's wrong with this page?" now has a visual answer.</p>
     </div>
     <div class="feat">
       <div class="feat-title">Modify any page</div>
-      <p>The sidebar can <span class="hl">edit CSS and DOM</span> on any page. "Make the header sticky" or "change the font to Inter." Changes happen live. The sidebar reports what it changed back to your Claude Code terminal.</p>
+      <p>The sidebar can <span class="hl">edit CSS and DOM</span> on any page. "Make the header sticky" or "change the font to Inter." Changes happen live, reported back to your terminal.</p>
     </div>
   </div>
 

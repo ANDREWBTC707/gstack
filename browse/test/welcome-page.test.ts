@@ -89,8 +89,10 @@ describe('welcome page served via HTTP', () => {
 
   // ─── Feature cards ────────────────────────────────────────────────
 
-  test('has all four feature cards', () => {
+  test('has all six feature cards', () => {
     expect(html).toContain('Talk to the sidebar');
+    expect(html).toContain('Or use your main agent');
+    expect(html).toContain('Import your cookies');
     expect(html).toContain('Clean up any page');
     expect(html).toContain('Smart screenshots');
     expect(html).toContain('Modify any page');
