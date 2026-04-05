@@ -1,25 +1,43 @@
 # Changelog
 
-## [0.15.7.0] - 2026-04-04 — OpenClaw Integration Design
+## [0.15.7.0] - 2026-04-04 — OpenClaw Integration: Two Runtimes, One Brain
 
-The architecture for running gstack inside OpenClaw ("two runtimes, one brain"). Your
-OpenClaw agent becomes the always-on orchestrator, gstack becomes the deep-work coding
-engine. Shared memory, dispatch protocol, Clawvisor security gateway.
+Your OpenClaw agent (Wintermute) can now dispatch coding tasks to gstack, share
+memory across runtimes, and pick up exactly where you left off. The full dispatch
+protocol, shared learnings bridge, and cross-runtime handoff system.
 
 ### Added
 
-- **OpenClaw v0 design doc.** Full architecture: generator-native skill output (already
-  done via multi-host), bidirectional learnings bridge, dispatch daemon with smart retry,
-  Clawvisor security gateway with standing tasks, session handoff with resume prompts,
-  weekly activity index, and universal dispatch protocol.
-- **SOUL.md for OpenClaw agents.** Persistent personality file that captures the builder
-  ethos: completeness, search-before-building, direct voice, structured dispatch reporting.
+- **Dispatch daemon.** `gstack-dispatch-daemon` watches `~/.gstack/dispatch/` for task
+  files from your OpenClaw agent. Spawns Claude Code sessions with scoped permissions,
+  enforces TTL, manages concurrency (default 2 parallel sessions), and reports
+  completion back via Clawvisor callback or local disk. Smart retry: rate limits get
+  one retry with 30s backoff, context overflow retries with stripped learnings.
+- **Bidirectional learnings bridge.** gstack now writes learnings as OpenClaw-readable
+  markdown files alongside native JSONL. gstack-learnings-search reads back from
+  OpenClaw memory files too. What gstack learns, Wintermute knows. What Wintermute
+  learns, gstack picks up on next session start.
+- **Weekly activity index.** Timeline events now write to weekly rollup files at
+  `~/.gstack/activity/activity-YYYY-WNN.jsonl`. Ask Wintermute "what did I ship this
+  week" and it reads one file, not 6 months of history.
+- **Checkpoint handoff with resume_prompt.** `/checkpoint` now writes a handoff file
+  with the exact prompt to resume the session in a new Claude Code instance. Wintermute
+  passes it straight through. Zero context reconstruction.
+- **gstack-bridge skill.** An OpenClaw SKILL.md that teaches any OpenClaw agent the
+  full dispatch protocol: how to create dispatch files, parse completion reports, read
+  handoffs, query activity timelines, sync learnings, and manage the daemon.
+- **Daemon lifecycle scripts.** `gstack-dispatch-install` creates a persistent launchd
+  (macOS) or systemd (Linux) service. `--uninstall` to remove cleanly.
+- **Shared routing config.** `gstack-routing-config` reads routing rules from
+  `~/.gstack/routing.yaml` or the `## Skill routing` section in CLAUDE.md/AGENTS.md.
+  Same routing table, two runtimes.
+- **SOUL.md for OpenClaw agents.** Builder identity: completeness, search-before-building,
+  direct voice, structured dispatch reporting.
 - **JSON Schema contracts.** Four schemas (dispatch, completion, handoff, activity-entry)
-  with formal type definitions so both runtimes validate against the same contract.
-- **COMPATIBILITY.md.** Schema evolution rules: additive-only for minor versions, strict
-  semver for breaking changes. "Breaking" defined in writing before you need it.
-- **OpenClaw host config enhancements.** Added `triggers` (renamed from voice-triggers),
-  `min_openclaw_version`, and synced version to 0.15.6.0.
+  validated by both the daemon and the bridge skill.
+- **COMPATIBILITY.md.** Schema evolution rules defined before you need them.
+- **OpenClaw v0 design doc.** Full architecture covering Clawvisor security gateway,
+  standing tasks, universal dispatch protocol (target_agent field), and error taxonomy.
 
 ### For contributors
 
