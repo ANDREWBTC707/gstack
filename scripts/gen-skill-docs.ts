@@ -507,11 +507,16 @@ for (const currentHost of hostsToRun) {
     let hasChanges = false;
     const tokenBudget: Array<{ skill: string; lines: number; tokens: number }> = [];
 
+    const currentHostConfig = getHostConfig(currentHost);
     for (const tmplPath of findTemplates()) {
-      // Skip skills listed in host config's generation.skipSkills
-      const currentHostConfig = getHostConfig(currentHost);
+      const dir = path.basename(path.dirname(tmplPath));
+
+      // includeSkills allowlist (union logic: include minus skip)
+      if (currentHostConfig.generation.includeSkills?.length) {
+        if (!currentHostConfig.generation.includeSkills.includes(dir)) continue;
+      }
+      // skipSkills denylist (subtracts from includeSkills or full set)
       if (currentHostConfig.generation.skipSkills?.length) {
-        const dir = path.basename(path.dirname(tmplPath));
         if (currentHostConfig.generation.skipSkills.includes(dir)) continue;
       }
 
@@ -537,6 +542,44 @@ for (const currentHost of hostsToRun) {
       const lines = content.split('\n').length;
       const tokens = Math.round(content.length / 4); // ~4 chars per token
       tokenBudget.push({ skill: relOutput, lines, tokens });
+    }
+
+    // Generate gstack-lite and gstack-full for OpenClaw host
+    if (currentHost === 'openclaw' && !DRY_RUN) {
+      const openclawDir = path.join(ROOT, 'openclaw');
+      if (!fs.existsSync(openclawDir)) fs.mkdirSync(openclawDir, { recursive: true });
+
+      const gstackLite = `# gstack-lite Planning Discipline
+
+Injected by Wintermute into spawned Claude Code sessions. Append to existing CLAUDE.md.
+
+## Planning Discipline
+1. Read every file you will modify. Understand existing patterns first.
+2. Before writing code, state your plan: what, why, which files, test case, risk.
+3. When ambiguous, prefer: completeness over shortcuts, existing patterns over new ones,
+   reversible choices over irreversible ones, safe defaults over clever ones.
+4. Self-review your changes before reporting done. Check for: missed files, broken
+   imports, untested paths, style inconsistencies.
+5. Report when done: what shipped, what decisions you made, anything uncertain.
+`;
+      fs.writeFileSync(path.join(openclawDir, 'gstack-lite-CLAUDE.md'), gstackLite);
+      console.log('GENERATED: openclaw/gstack-lite-CLAUDE.md');
+
+      const gstackFull = `# gstack-full Pipeline
+
+Injected by Wintermute for complete feature builds. Append to existing CLAUDE.md.
+
+## Full Pipeline
+1. Read CLAUDE.md and understand the project context.
+2. Run /autoplan to review your approach (CEO + eng + design review pipeline).
+3. Implement the approved plan. Follow the planning discipline above.
+4. Run /ship to create a PR with tests, changelog, and version bump.
+5. Report back: PR URL, what shipped, decisions made, anything uncertain.
+
+Do not ask for human input until the PR is ready for review.
+`;
+      fs.writeFileSync(path.join(openclawDir, 'gstack-full-CLAUDE.md'), gstackFull);
+      console.log('GENERATED: openclaw/gstack-full-CLAUDE.md');
     }
 
     if (DRY_RUN && hasChanges) {
