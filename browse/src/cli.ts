@@ -589,6 +589,7 @@ function hasFlag(args: string[], flag: string): boolean {
 
 async function handlePairAgent(state: ServerState, args: string[]): Promise<void> {
   const clientName = parseFlag(args, '--client') || `remote-${Date.now()}`;
+  const domains = parseFlag(args, '--domain')?.split(',').map(d => d.trim());
   const admin = hasFlag(args, '--admin');
   const localHost = parseFlag(args, '--local');
 
@@ -600,6 +601,8 @@ async function handlePairAgent(state: ServerState, args: string[]): Promise<void
       'Authorization': `Bearer ${state.token}`,
     },
     body: JSON.stringify({
+      domains,
+
       clientId: clientName,
       admin,
     }),
@@ -844,7 +847,9 @@ Refs:           After 'snapshot', use @e1, @e2... as selectors:
           'Content-Type': 'application/json',
           'Authorization': `Bearer ${newState.token}`,
         },
-        body: JSON.stringify({ command: 'status', args: [] }),
+        body: JSON.stringify({
+      domains,
+ command: 'status', args: [] }),
         signal: AbortSignal.timeout(5000),
       });
       const status = await resp.text();
@@ -918,7 +923,9 @@ Refs:           After 'snapshot', use @e1, @e2... as selectors:
           'Content-Type': 'application/json',
           'Authorization': `Bearer ${existingState.token}`,
         },
-        body: JSON.stringify({ command: 'disconnect', args: [] }),
+        body: JSON.stringify({
+      domains,
+ command: 'disconnect', args: [] }),
         signal: AbortSignal.timeout(3000),
       });
       if (resp.ok) {
