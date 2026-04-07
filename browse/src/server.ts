@@ -20,7 +20,18 @@ import { handleMetaCommand } from './meta-commands';
 import { handleCookiePickerRoute } from './cookie-picker-routes';
 import { sanitizeExtensionUrl } from './sidebar-utils';
 import { COMMAND_DESCRIPTIONS, PAGE_CONTENT_COMMANDS, wrapUntrustedContent } from './commands';
+import {
+  wrapUntrustedPageContent, datamarkContent,
+  runContentFilters, type ContentFilterResult,
+  markHiddenElements, getCleanTextWithStripping, cleanupHiddenMarkers,
+} from './content-security';
 import { handleSnapshot, SNAPSHOT_FLAGS } from './snapshot';
+import {
+  initRegistry, validateToken as validateScopedToken, checkScope, checkDomain,
+  checkRate, createToken, createSetupKey, exchangeSetupKey, revokeToken,
+  rotateRoot, listTokens, serializeRegistry, restoreRegistry, recordCommand,
+  isRootToken, checkConnectRateLimit, type TokenInfo,
+} from './token-registry';
 import { resolveConfig, ensureStateDir, readVersionHash } from './config';
 import { emitActivity, subscribe, getActivityAfter, getActivityHistory, getSubscriberCount } from './activity';
 import { inspectElement, modifyStyle, resetModifications, getModificationHistory, detachSession, type InspectorResult } from './cdp-inspector';
@@ -37,13 +48,39 @@ ensureStateDir(config);
 
 // ─── Auth ───────────────────────────────────────────────────────
 const AUTH_TOKEN = crypto.randomUUID();
+initRegistry(AUTH_TOKEN);
 const BROWSE_PORT = parseInt(process.env.BROWSE_PORT || '0', 10);
 const IDLE_TIMEOUT_MS = parseInt(process.env.BROWSE_IDLE_TIMEOUT || '1800000', 10); // 30 min
 // Sidebar chat is always enabled in headed mode (ungated in v0.12.0)
 
+// ─── Tunnel State ───────────────────────────────────────────────
+let tunnelActive = false;
+let tunnelUrl: string | null = null;
+let tunnelListener: any = null; // ngrok listener handle
+
 function validateAuth(req: Request): boolean {
   const header = req.headers.get('authorization');
   return header === `Bearer ${AUTH_TOKEN}`;
+}
+
+/** Extract bearer token from request. Returns the token string or null. */
+function extractToken(req: Request): string | null {
+  const header = req.headers.get('authorization');
+  if (!header?.startsWith('Bearer ')) return null;
+  return header.slice(7);
+}
+
+/** Validate token and return TokenInfo. Returns null if invalid/expired. */
+function getTokenInfo(req: Request): TokenInfo | null {
+  const token = extractToken(req);
+  if (!token) return null;
+  return validateScopedToken(token);
+}
+
+/** Check if request is from root token (local use). */
+function isRootRequest(req: Request): boolean {
+  const token = extractToken(req);
+  return token !== null && isRootToken(token);
 }
 
 // ─── Sidebar Model Router ────────────────────────────────────────
@@ -282,6 +319,10 @@ function loadSession(): SidebarSession | null {
   try {
     const activeFile = path.join(SESSIONS_DIR, 'active.json');
     const activeData = JSON.parse(fs.readFileSync(activeFile, 'utf-8'));
+    if (typeof activeData.id !== 'string' || !/^[a-zA-Z0-9_-]+$/.test(activeData.id)) {
+      console.warn('[browse] Invalid session ID in active.json — ignoring');
+      return null;
+    }
     const sessionFile = path.join(SESSIONS_DIR, activeData.id, 'session.json');
     const session = JSON.parse(fs.readFileSync(sessionFile, 'utf-8')) as SidebarSession;
     // Validate worktree still exists — crash may have left stale path
@@ -560,6 +601,7 @@ function spawnClaude(userMessage: string, extensionUrl?: string | null, forTabId
   try {
     fs.mkdirSync(gstackDir, { recursive: true, mode: 0o700 });
     fs.appendFileSync(agentQueue, entry + '\n');
+    try { fs.chmodSync(agentQueue, 0o600); } catch {}
   } catch (err: any) {
     addChatEntry({ ts: new Date().toISOString(), role: 'agent', type: 'agent_error', error: `Failed to queue: ${err.message}` });
     agentStatus = 'idle';
@@ -572,7 +614,7 @@ function spawnClaude(userMessage: string, extensionUrl?: string | null, forTabId
   // Agent status transitions happen when we receive agent_done/agent_error events.
 }
 
-function killAgent(): void {
+function killAgent(targetTabId?: number | null): void {
   if (agentProcess) {
     try { agentProcess.kill('SIGTERM'); } catch (err: any) {
       console.warn('[browse] Failed to SIGTERM agent:', err.message);
@@ -581,17 +623,18 @@ function killAgent(): void {
       console.warn('[browse] Failed to SIGKILL agent:', err.message);
     } }, 3000);
   }
+  // Signal the sidebar-agent worker to cancel via a per-tab cancel file.
+  // Using per-tab files prevents race conditions where one agent's cancel
+  // signal is consumed by a different tab's agent in concurrent mode.
+  // When targetTabId is provided, only that tab's agent is cancelled.
+  const cancelDir = path.join(process.env.HOME || '/tmp', '.gstack');
+  const tabId = targetTabId ?? agentTabId ?? 0;
+  const cancelFile = path.join(cancelDir, `sidebar-agent-cancel-${tabId}`);
+  try { fs.writeFileSync(cancelFile, Date.now().toString()); } catch {}
   agentProcess = null;
   agentStartTime = null;
   currentMessage = null;
   agentStatus = 'idle';
-
-  // Signal sidebar-agent.ts to kill its active claude subprocess.
-  // sidebar-agent runs in a separate non-compiled Bun process (posix_spawn
-  // limitation). It polls the kill-signal file and terminates on any write.
-  const agentQueue = process.env.SIDEBAR_QUEUE_PATH || path.join(process.env.HOME || '/tmp', '.gstack', 'sidebar-agent-queue.jsonl');
-  const killFile = path.join(path.dirname(agentQueue), 'sidebar-agent-kill');
-  try { fs.writeFileSync(killFile, String(Date.now())); } catch {}
 }
 
 // Agent health check — detect hung processes
@@ -685,11 +728,30 @@ const idleCheckInterval = setInterval(() => {
   // Headed mode: the user is looking at the browser. Never auto-die.
   // Only shut down when the user explicitly disconnects or closes the window.
   if (browserManager.getConnectionMode() === 'headed') return;
+  // Tunnel mode: remote agents may send commands sporadically. Never auto-die.
+  if (tunnelActive) return;
   if (Date.now() - lastActivity > IDLE_TIMEOUT_MS) {
     console.log(`[browse] Idle for ${IDLE_TIMEOUT_MS / 1000}s, shutting down`);
     shutdown();
   }
 }, 60_000);
+
+// ─── Parent-Process Watchdog ────────────────────────────────────────
+// When the spawning CLI process (e.g. a Claude Code session) exits, this
+// server can become an orphan — keeping chrome-headless-shell alive and
+// causing console-window flicker on Windows. Poll the parent PID every 15s
+// and self-terminate if it is gone.
+const BROWSE_PARENT_PID = parseInt(process.env.BROWSE_PARENT_PID || '0', 10);
+if (BROWSE_PARENT_PID > 0) {
+  setInterval(() => {
+    try {
+      process.kill(BROWSE_PARENT_PID, 0); // signal 0 = existence check only, no signal sent
+    } catch {
+      console.log(`[browse] Parent process ${BROWSE_PARENT_PID} exited, shutting down`);
+      shutdown();
+    }
+  }, 15_000);
+}
 
 // ─── Command Sets (from commands.ts — single source of truth) ───
 import { READ_COMMANDS, WRITE_COMMANDS, META_COMMANDS } from './commands';
@@ -777,14 +839,81 @@ function wrapError(err: any): string {
   return msg;
 }
 
-async function handleCommand(body: any): Promise<Response> {
+/** Internal command result — used by handleCommand and chain subcommand routing */
+interface CommandResult {
+  status: number;
+  result: string;
+  headers?: Record<string, string>;
+  json?: boolean; // true if result is JSON (errors), false for text/plain
+}
+
+/**
+ * Core command execution logic. Returns a structured result instead of HTTP Response.
+ * Used by both the HTTP handler (handleCommand) and chain subcommand routing.
+ *
+ * Options:
+ *   skipRateCheck: true when called from chain (chain counts as 1 request)
+ *   skipActivity: true when called from chain (chain emits 1 event for all subcommands)
+ *   chainDepth: recursion guard — reject nested chains (depth > 0 means inside a chain)
+ */
+async function handleCommandInternal(
+  body: { command: string; args?: string[]; tabId?: number },
+  tokenInfo?: TokenInfo | null,
+  opts?: { skipRateCheck?: boolean; skipActivity?: boolean; chainDepth?: number },
+): Promise<CommandResult> {
   const { command, args = [], tabId } = body;
 
   if (!command) {
-    return new Response(JSON.stringify({ error: 'Missing "command" field' }), {
-      status: 400,
-      headers: { 'Content-Type': 'application/json' },
-    });
+    return { status: 400, result: JSON.stringify({ error: 'Missing "command" field' }), json: true };
+  }
+
+  // ─── Recursion guard: reject nested chains ──────────────────
+  if (command === 'chain' && (opts?.chainDepth ?? 0) > 0) {
+    return { status: 400, result: JSON.stringify({ error: 'Nested chain commands are not allowed' }), json: true };
+  }
+
+  // ─── Scope check (for scoped tokens) ──────────────────────────
+  if (tokenInfo && tokenInfo.clientId !== 'root') {
+    if (!checkScope(tokenInfo, command)) {
+      return {
+        status: 403, json: true,
+        result: JSON.stringify({
+          error: `Command "${command}" not allowed by your token scope`,
+          hint: `Your scopes: ${tokenInfo.scopes.join(', ')}. Ask the user to re-pair with --admin for eval/cookies/storage access.`,
+        }),
+      };
+    }
+
+    // Domain check for navigation commands
+    if ((command === 'goto' || command === 'newtab') && args[0]) {
+      if (!checkDomain(tokenInfo, args[0])) {
+        return {
+          status: 403, json: true,
+          result: JSON.stringify({
+            error: `Domain not allowed by your token scope`,
+            hint: `Allowed domains: ${tokenInfo.domains?.join(', ') || 'none configured'}`,
+          }),
+        };
+      }
+    }
+
+    // Rate check (skipped for chain subcommands — chain counts as 1 request)
+    if (!opts?.skipRateCheck) {
+      const rateResult = checkRate(tokenInfo);
+      if (!rateResult.allowed) {
+        return {
+          status: 429, json: true,
+          result: JSON.stringify({
+            error: 'Rate limit exceeded',
+            hint: `Max ${tokenInfo.rateLimit} requests/second. Retry after ${rateResult.retryAfterMs}ms.`,
+          }),
+          headers: { 'Retry-After': String(Math.ceil((rateResult.retryAfterMs || 1000) / 1000)) },
+        };
+      }
+    }
+
+    // Record command execution for idempotent key exchange tracking
+    if (!opts?.skipRateCheck && tokenInfo.token) recordCommand(tokenInfo.token);
   }
 
   // Pin to a specific tab if requested (set by BROWSE_TAB env var in sidebar agents).
@@ -799,26 +928,54 @@ async function handleCommand(body: any): Promise<Response> {
     }
   }
 
-  // Block mutation commands while watching (read-only observation mode)
-  if (browserManager.isWatching() && WRITE_COMMANDS.has(command)) {
-    return new Response(JSON.stringify({
-      error: 'Cannot run mutation commands while watching. Run `$B watch stop` first.',
-    }), {
-      status: 400,
-      headers: { 'Content-Type': 'application/json' },
-    });
+  // ─── Tab ownership check (for scoped tokens) ──────────────
+  if (tokenInfo && tokenInfo.clientId !== 'root' && (WRITE_COMMANDS.has(command) || tokenInfo.tabPolicy === 'own-only')) {
+    const targetTab = tabId ?? browserManager.getActiveTabId();
+    if (!browserManager.checkTabAccess(targetTab, tokenInfo.clientId, { isWrite: WRITE_COMMANDS.has(command), ownOnly: tokenInfo.tabPolicy === 'own-only' })) {
+      return {
+        status: 403, json: true,
+        result: JSON.stringify({
+          error: 'Tab not owned by your agent. Use newtab to create your own tab.',
+          hint: `Tab ${targetTab} is owned by ${browserManager.getTabOwner(targetTab) || 'root'}. Your agent: ${tokenInfo.clientId}.`,
+        }),
+      };
+    }
   }
 
-  // Activity: emit command_start
+  // ─── newtab with ownership for scoped tokens ──────────────
+  if (command === 'newtab' && tokenInfo && tokenInfo.clientId !== 'root') {
+    const newId = await browserManager.newTab(args[0] || undefined, tokenInfo.clientId);
+    return {
+      status: 200, json: true,
+      result: JSON.stringify({
+        tabId: newId,
+        owner: tokenInfo.clientId,
+        hint: 'Include "tabId": ' + newId + ' in subsequent commands to target this tab.',
+      }),
+    };
+  }
+
+  // Block mutation commands while watching (read-only observation mode)
+  if (browserManager.isWatching() && WRITE_COMMANDS.has(command)) {
+    return {
+      status: 400, json: true,
+      result: JSON.stringify({ error: 'Cannot run mutation commands while watching. Run `$B watch stop` first.' }),
+    };
+  }
+
+  // Activity: emit command_start (skipped for chain subcommands)
   const startTime = Date.now();
-  emitActivity({
-    type: 'command_start',
-    command,
-    args,
-    url: browserManager.getCurrentUrl(),
-    tabs: browserManager.getTabCount(),
-    mode: browserManager.getConnectionMode(),
-  });
+  if (!opts?.skipActivity) {
+    emitActivity({
+      type: 'command_start',
+      command,
+      args,
+      url: browserManager.getCurrentUrl(),
+      tabs: browserManager.getTabCount(),
+      mode: browserManager.getConnectionMode(),
+      clientId: tokenInfo?.clientId,
+    });
+  }
 
   try {
     let result: string;
@@ -826,14 +983,37 @@ async function handleCommand(body: any): Promise<Response> {
     const session = browserManager.getActiveSession();
 
     if (READ_COMMANDS.has(command)) {
-      result = await handleReadCommand(command, args, session);
-      if (PAGE_CONTENT_COMMANDS.has(command)) {
-        result = wrapUntrustedContent(result, browserManager.getCurrentUrl());
+      const isScoped = tokenInfo && tokenInfo.clientId !== 'root';
+      // Hidden element stripping for scoped tokens on text command
+      if (isScoped && command === 'text') {
+        const page = session.getPage();
+        const strippedDescs = await markHiddenElements(page);
+        if (strippedDescs.length > 0) {
+          console.warn(`[browse] Content security: stripped ${strippedDescs.length} hidden elements for ${tokenInfo.clientId}`);
+        }
+        try {
+          const target = session.getActiveFrameOrPage();
+          result = await getCleanTextWithStripping(target);
+        } finally {
+          await cleanupHiddenMarkers(page);
+        }
+      } else {
+        result = await handleReadCommand(command, args, session);
       }
     } else if (WRITE_COMMANDS.has(command)) {
       result = await handleWriteCommand(command, args, session, browserManager);
     } else if (META_COMMANDS.has(command)) {
-      result = await handleMetaCommand(command, args, browserManager, shutdown);
+      // Pass chain depth + executeCommand callback so chain routes subcommands
+      // through the full security pipeline (scope, domain, tab, wrapping).
+      const chainDepth = (opts?.chainDepth ?? 0);
+      result = await handleMetaCommand(command, args, browserManager, shutdown, tokenInfo, {
+        chainDepth,
+        executeCommand: (body, ti) => handleCommandInternal(body, ti, {
+          skipRateCheck: true,    // chain counts as 1 request
+          skipActivity: true,     // chain emits 1 event for all subcommands
+          chainDepth: chainDepth + 1,  // recursion guard
+        }),
+      });
       // Start periodic snapshot interval when watch mode begins
       if (command === 'watch' && args[0] !== 'stop' && browserManager.isWatching()) {
         const watchInterval = setInterval(async () => {
@@ -852,32 +1032,61 @@ async function handleCommand(body: any): Promise<Response> {
       }
     } else if (command === 'help') {
       const helpText = generateHelpText();
-      return new Response(helpText, {
-        status: 200,
-        headers: { 'Content-Type': 'text/plain' },
-      });
+      return { status: 200, result: helpText };
     } else {
-      return new Response(JSON.stringify({
-        error: `Unknown command: ${command}`,
-        hint: `Available commands: ${[...READ_COMMANDS, ...WRITE_COMMANDS, ...META_COMMANDS].sort().join(', ')}`,
-      }), {
-        status: 400,
-        headers: { 'Content-Type': 'application/json' },
-      });
+      return {
+        status: 400, json: true,
+        result: JSON.stringify({
+          error: `Unknown command: ${command}`,
+          hint: `Available commands: ${[...READ_COMMANDS, ...WRITE_COMMANDS, ...META_COMMANDS].sort().join(', ')}`,
+        }),
+      };
     }
 
-    // Activity: emit command_end (success)
-    emitActivity({
-      type: 'command_end',
-      command,
-      args,
-      url: browserManager.getCurrentUrl(),
-      duration: Date.now() - startTime,
-      status: 'ok',
-      result: result,
-      tabs: browserManager.getTabCount(),
-      mode: browserManager.getConnectionMode(),
-    });
+    // ─── Centralized content wrapping (single location for all commands) ───
+    // Scoped tokens: content filter + enhanced envelope + datamarking
+    // Root tokens: basic untrusted content wrapper (backward compat)
+    // Chain exempt from top-level wrapping (each subcommand wrapped individually)
+    if (PAGE_CONTENT_COMMANDS.has(command) && command !== 'chain') {
+      const isScoped = tokenInfo && tokenInfo.clientId !== 'root';
+      if (isScoped) {
+        // Run content filters
+        const filterResult: ContentFilterResult = runContentFilters(
+          result, browserManager.getCurrentUrl(), command,
+        );
+        if (filterResult.blocked) {
+          return { status: 403, json: true, result: JSON.stringify({ error: filterResult.message }) };
+        }
+        // Datamark text command output only (not html, forms, or structured data)
+        if (command === 'text') {
+          result = datamarkContent(result);
+        }
+        // Enhanced envelope wrapping for scoped tokens
+        result = wrapUntrustedPageContent(
+          result, command,
+          filterResult.warnings.length > 0 ? filterResult.warnings : undefined,
+        );
+      } else {
+        // Root token: basic wrapping (backward compat, Decision 2)
+        result = wrapUntrustedContent(result, browserManager.getCurrentUrl());
+      }
+    }
+
+    // Activity: emit command_end (skipped for chain subcommands)
+    if (!opts?.skipActivity) {
+      emitActivity({
+        type: 'command_end',
+        command,
+        args,
+        url: browserManager.getCurrentUrl(),
+        duration: Date.now() - startTime,
+        status: 'ok',
+        result: result,
+        tabs: browserManager.getTabCount(),
+        mode: browserManager.getConnectionMode(),
+        clientId: tokenInfo?.clientId,
+      });
+    }
 
     browserManager.resetFailures();
     // Restore original active tab if we pinned to a specific one
@@ -886,10 +1095,7 @@ async function handleCommand(body: any): Promise<Response> {
         console.warn('[browse] Failed to restore tab after command:', restoreErr.message);
       }
     }
-    return new Response(result, {
-      status: 200,
-      headers: { 'Content-Type': 'text/plain' },
-    });
+    return { status: 200, result };
   } catch (err: any) {
     // Restore original active tab even on error
     if (savedTabId !== null) {
@@ -898,28 +1104,38 @@ async function handleCommand(body: any): Promise<Response> {
       }
     }
 
-    // Activity: emit command_end (error)
-    emitActivity({
-      type: 'command_end',
-      command,
-      args,
-      url: browserManager.getCurrentUrl(),
-      duration: Date.now() - startTime,
-      status: 'error',
-      error: err.message,
-      tabs: browserManager.getTabCount(),
-      mode: browserManager.getConnectionMode(),
-    });
+    // Activity: emit command_end (error) — skipped for chain subcommands
+    if (!opts?.skipActivity) {
+      emitActivity({
+        type: 'command_end',
+        command,
+        args,
+        url: browserManager.getCurrentUrl(),
+        duration: Date.now() - startTime,
+        status: 'error',
+        error: err.message,
+        tabs: browserManager.getTabCount(),
+        mode: browserManager.getConnectionMode(),
+        clientId: tokenInfo?.clientId,
+      });
+    }
 
     browserManager.incrementFailures();
     let errorMsg = wrapError(err);
     const hint = browserManager.getFailureHint();
     if (hint) errorMsg += '\n' + hint;
-    return new Response(JSON.stringify({ error: errorMsg }), {
-      status: 500,
-      headers: { 'Content-Type': 'application/json' },
-    });
+    return { status: 500, result: JSON.stringify({ error: errorMsg }), json: true };
   }
+}
+
+/** HTTP wrapper — converts CommandResult to Response */
+async function handleCommand(body: any, tokenInfo?: TokenInfo | null): Promise<Response> {
+  const cr = await handleCommandInternal(body, tokenInfo);
+  const contentType = cr.json ? 'application/json' : 'text/plain';
+  return new Response(cr.result, {
+    status: cr.status,
+    headers: { 'Content-Type': contentType, ...cr.headers },
+  });
 }
 
 async function shutdown() {
@@ -1062,12 +1278,13 @@ async function start() {
         const welcomePath = (() => {
           // Check project-local designs first, then global
           const slug = process.env.GSTACK_SLUG || 'unknown';
-          const projectWelcome = `${process.env.HOME}/.gstack/projects/${slug}/designs/welcome-page-20260331/finalized.html`;
+          const homeDir = process.env.HOME || process.env.USERPROFILE || '/tmp';
+          const projectWelcome = `${homeDir}/.gstack/projects/${slug}/designs/welcome-page-20260331/finalized.html`;
           try { if (require('fs').existsSync(projectWelcome)) return projectWelcome; } catch (err: any) {
             console.warn('[browse] Error checking project welcome page:', err.message);
           }
           // Fallback: built-in welcome page from gstack install
-          const skillRoot = process.env.GSTACK_SKILL_ROOT || `${process.env.HOME}/.claude/skills/gstack`;
+          const skillRoot = process.env.GSTACK_SKILL_ROOT || `${homeDir}/.claude/skills/gstack`;
           const builtinWelcome = `${skillRoot}/browse/src/welcome.html`;
           try { if (require('fs').existsSync(builtinWelcome)) return builtinWelcome; } catch (err: any) {
             console.warn('[browse] Error checking builtin welcome page:', err.message);
@@ -1082,8 +1299,14 @@ async function start() {
             console.error('[browse] Failed to read welcome page:', welcomePath, err.message);
           }
         }
-        // No welcome page found — redirect to about:blank
-        return new Response('', { status: 302, headers: { 'Location': 'about:blank' } });
+        // No welcome page found — serve a simple fallback (avoid ERR_UNSAFE_REDIRECT on Windows)
+        return new Response(
+          `<!DOCTYPE html><html><head><title>GStack Browser</title>
+          <style>body{background:#111;color:#fff;font-family:system-ui;display:flex;align-items:center;justify-content:center;height:100vh;margin:0;}
+          .msg{text-align:center;opacity:.7;}.gold{color:#f5a623;font-size:2em;margin-bottom:12px;}</style></head>
+          <body><div class="msg"><div class="gold">◈</div><p>GStack Browser ready.</p><p style="font-size:.85em">Waiting for commands from Claude Code.</p></div></body></html>`,
+          { status: 200, headers: { 'Content-Type': 'text/html; charset=utf-8' } }
+        );
       }
 
       // Health check — no auth required, does NOT reset idle timer
@@ -1094,17 +1317,18 @@ async function start() {
           mode: browserManager.getConnectionMode(),
           uptime: Math.floor((Date.now() - startTime) / 1000),
           tabs: browserManager.getTabCount(),
-          currentUrl: browserManager.getCurrentUrl(),
-          // Auth token for extension bootstrap. Only returned when the request
-          // comes from a Chrome extension (Origin: chrome-extension://...).
+          // Auth token for extension bootstrap. Safe: /health is localhost-only.
           // Previously served unconditionally, but that leaks the token if the
           // server is tunneled to the internet (ngrok, SSH tunnel).
-          ...(req.headers.get('origin')?.startsWith('chrome-extension://') ? { token: AUTH_TOKEN } : {}),
+          // In headed mode the server is always local, so return token unconditionally
+          // (fixes Playwright Chromium extensions that don't send Origin header).
+          ...(browserManager.getConnectionMode() === 'headed' ||
+              req.headers.get('origin')?.startsWith('chrome-extension://')
+              ? { token: AUTH_TOKEN } : {}),
           chatEnabled: true,
           agent: {
             status: agentStatus,
             runningFor: agentStartTime ? Date.now() - agentStartTime : null,
-            currentMessage,
             queueLength: messageQueue.length,
           },
           session: sidebarSession ? { id: sidebarSession.id, name: sidebarSession.name } : null,
@@ -1112,6 +1336,255 @@ async function start() {
           status: 200,
           headers: { 'Content-Type': 'application/json' },
         });
+      }
+
+      // ─── /connect — setup key exchange for /pair-agent ceremony ────
+      if (url.pathname === '/connect' && req.method === 'POST') {
+        if (!checkConnectRateLimit()) {
+          return new Response(JSON.stringify({
+            error: 'Too many connection attempts. Wait 1 minute.',
+          }), { status: 429, headers: { 'Content-Type': 'application/json' } });
+        }
+        try {
+          const connectBody = await req.json() as { setup_key?: string };
+          if (!connectBody.setup_key) {
+            return new Response(JSON.stringify({ error: 'Missing setup_key' }), {
+              status: 400, headers: { 'Content-Type': 'application/json' },
+            });
+          }
+          const session = exchangeSetupKey(connectBody.setup_key);
+          if (!session) {
+            return new Response(JSON.stringify({
+              error: 'Invalid, expired, or already-used setup key',
+            }), { status: 401, headers: { 'Content-Type': 'application/json' } });
+          }
+          console.log(`[browse] Remote agent connected: ${session.clientId} (scopes: ${session.scopes.join(',')})`);
+          return new Response(JSON.stringify({
+            token: session.token,
+            expires: session.expiresAt,
+            scopes: session.scopes,
+            agent: session.clientId,
+          }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+        } catch {
+          return new Response(JSON.stringify({ error: 'Invalid request body' }), {
+            status: 400, headers: { 'Content-Type': 'application/json' },
+          });
+        }
+      }
+
+      // ─── /token — mint scoped tokens (root-only) ──────────────────
+      if (url.pathname === '/token' && req.method === 'POST') {
+        if (!isRootRequest(req)) {
+          return new Response(JSON.stringify({
+            error: 'Only the root token can mint sub-tokens',
+          }), { status: 403, headers: { 'Content-Type': 'application/json' } });
+        }
+        try {
+          const tokenBody = await req.json() as any;
+          if (!tokenBody.clientId) {
+            return new Response(JSON.stringify({ error: 'Missing clientId' }), {
+              status: 400, headers: { 'Content-Type': 'application/json' },
+            });
+          }
+          const session = createToken({
+            clientId: tokenBody.clientId,
+            scopes: tokenBody.scopes,
+            domains: tokenBody.domains,
+            tabPolicy: tokenBody.tabPolicy,
+            rateLimit: tokenBody.rateLimit,
+            expiresSeconds: tokenBody.expiresSeconds,
+          });
+          return new Response(JSON.stringify({
+            token: session.token,
+            expires: session.expiresAt,
+            scopes: session.scopes,
+            agent: session.clientId,
+          }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+        } catch {
+          return new Response(JSON.stringify({ error: 'Invalid request body' }), {
+            status: 400, headers: { 'Content-Type': 'application/json' },
+          });
+        }
+      }
+
+      // ─── /token/:clientId — revoke a scoped token (root-only) ─────
+      if (url.pathname.startsWith('/token/') && req.method === 'DELETE') {
+        if (!isRootRequest(req)) {
+          return new Response(JSON.stringify({ error: 'Root token required' }), {
+            status: 403, headers: { 'Content-Type': 'application/json' },
+          });
+        }
+        const clientId = url.pathname.slice('/token/'.length);
+        const revoked = revokeToken(clientId);
+        if (!revoked) {
+          return new Response(JSON.stringify({ error: `Agent "${clientId}" not found` }), {
+            status: 404, headers: { 'Content-Type': 'application/json' },
+          });
+        }
+        console.log(`[browse] Revoked token for: ${clientId}`);
+        return new Response(JSON.stringify({ revoked: clientId }), {
+          status: 200, headers: { 'Content-Type': 'application/json' },
+        });
+      }
+
+      // ─── /agents — list connected agents (root-only) ──────────────
+      if (url.pathname === '/agents' && req.method === 'GET') {
+        if (!isRootRequest(req)) {
+          return new Response(JSON.stringify({ error: 'Root token required' }), {
+            status: 403, headers: { 'Content-Type': 'application/json' },
+          });
+        }
+        const agents = listTokens().map(t => ({
+          clientId: t.clientId,
+          scopes: t.scopes,
+          domains: t.domains,
+          expiresAt: t.expiresAt,
+          commandCount: t.commandCount,
+          createdAt: t.createdAt,
+        }));
+        return new Response(JSON.stringify({ agents }), {
+          status: 200, headers: { 'Content-Type': 'application/json' },
+        });
+      }
+
+      // ─── /pair — create setup key for pair-agent ceremony (root-only) ───
+      if (url.pathname === '/pair' && req.method === 'POST') {
+        if (!isRootRequest(req)) {
+          return new Response(JSON.stringify({ error: 'Root token required' }), {
+            status: 403, headers: { 'Content-Type': 'application/json' },
+          });
+        }
+        try {
+          const pairBody = await req.json() as any;
+          const scopes = pairBody.admin
+            ? ['read', 'write', 'admin', 'meta'] as const
+            : (pairBody.scopes || ['read', 'write']) as const;
+          const setupKey = createSetupKey({
+            clientId: pairBody.clientId,
+            scopes: [...scopes],
+            domains: pairBody.domains,
+            rateLimit: pairBody.rateLimit,
+          });
+          // Verify tunnel is actually alive before reporting it (ngrok may have died externally)
+          let verifiedTunnelUrl: string | null = null;
+          if (tunnelActive && tunnelUrl) {
+            try {
+              const probe = await fetch(`${tunnelUrl}/health`, {
+                headers: { 'ngrok-skip-browser-warning': 'true' },
+                signal: AbortSignal.timeout(5000),
+              });
+              if (probe.ok) {
+                verifiedTunnelUrl = tunnelUrl;
+              } else {
+                console.warn(`[browse] Tunnel probe failed (HTTP ${probe.status}), marking tunnel as dead`);
+                tunnelActive = false;
+                tunnelUrl = null;
+                tunnelListener = null;
+              }
+            } catch {
+              console.warn('[browse] Tunnel probe timed out or unreachable, marking tunnel as dead');
+              tunnelActive = false;
+              tunnelUrl = null;
+              tunnelListener = null;
+            }
+          }
+          return new Response(JSON.stringify({
+            setup_key: setupKey.token,
+            expires_at: setupKey.expiresAt,
+            scopes: setupKey.scopes,
+            tunnel_url: verifiedTunnelUrl,
+            server_url: `http://127.0.0.1:${server?.port || 0}`,
+          }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+        } catch {
+          return new Response(JSON.stringify({ error: 'Invalid request body' }), {
+            status: 400, headers: { 'Content-Type': 'application/json' },
+          });
+        }
+      }
+
+      // ─── /tunnel/start — start ngrok tunnel on demand (root-only) ──
+      if (url.pathname === '/tunnel/start' && req.method === 'POST') {
+        if (!isRootRequest(req)) {
+          return new Response(JSON.stringify({ error: 'Root token required' }), {
+            status: 403, headers: { 'Content-Type': 'application/json' },
+          });
+        }
+        if (tunnelActive && tunnelUrl) {
+          // Verify tunnel is still alive before returning cached URL
+          try {
+            const probe = await fetch(`${tunnelUrl}/health`, {
+              headers: { 'ngrok-skip-browser-warning': 'true' },
+              signal: AbortSignal.timeout(5000),
+            });
+            if (probe.ok) {
+              return new Response(JSON.stringify({ url: tunnelUrl, already_active: true }), {
+                status: 200, headers: { 'Content-Type': 'application/json' },
+              });
+            }
+          } catch {}
+          // Tunnel is dead, reset and fall through to restart
+          console.warn('[browse] Cached tunnel is dead, restarting...');
+          tunnelActive = false;
+          tunnelUrl = null;
+          tunnelListener = null;
+        }
+        try {
+          // Read ngrok authtoken: env var > ~/.gstack/ngrok.env > ngrok native config
+          let authtoken = process.env.NGROK_AUTHTOKEN;
+          if (!authtoken) {
+            const ngrokEnvPath = path.join(process.env.HOME || '', '.gstack', 'ngrok.env');
+            if (fs.existsSync(ngrokEnvPath)) {
+              const envContent = fs.readFileSync(ngrokEnvPath, 'utf-8');
+              const match = envContent.match(/^NGROK_AUTHTOKEN=(.+)$/m);
+              if (match) authtoken = match[1].trim();
+            }
+          }
+          if (!authtoken) {
+            // Check ngrok's native config files
+            const ngrokConfigs = [
+              path.join(process.env.HOME || '', 'Library', 'Application Support', 'ngrok', 'ngrok.yml'),
+              path.join(process.env.HOME || '', '.config', 'ngrok', 'ngrok.yml'),
+              path.join(process.env.HOME || '', '.ngrok2', 'ngrok.yml'),
+            ];
+            for (const conf of ngrokConfigs) {
+              try {
+                const content = fs.readFileSync(conf, 'utf-8');
+                const match = content.match(/authtoken:\s*(.+)/);
+                if (match) { authtoken = match[1].trim(); break; }
+              } catch {}
+            }
+          }
+          if (!authtoken) {
+            return new Response(JSON.stringify({
+              error: 'No ngrok authtoken found',
+              hint: 'Run: ngrok config add-authtoken YOUR_TOKEN',
+            }), { status: 400, headers: { 'Content-Type': 'application/json' } });
+          }
+          const ngrok = await import('@ngrok/ngrok');
+          const domain = process.env.NGROK_DOMAIN;
+          const forwardOpts: any = { addr: server!.port, authtoken };
+          if (domain) forwardOpts.domain = domain;
+
+          tunnelListener = await ngrok.forward(forwardOpts);
+          tunnelUrl = tunnelListener.url();
+          tunnelActive = true;
+          console.log(`[browse] Tunnel started on demand: ${tunnelUrl}`);
+
+          // Update state file
+          const stateContent = JSON.parse(fs.readFileSync(config.stateFile, 'utf-8'));
+          stateContent.tunnel = { url: tunnelUrl, domain: domain || null, startedAt: new Date().toISOString() };
+          const tmpState = config.stateFile + '.tmp';
+          fs.writeFileSync(tmpState, JSON.stringify(stateContent, null, 2), { mode: 0o600 });
+          fs.renameSync(tmpState, config.stateFile);
+
+          return new Response(JSON.stringify({ url: tunnelUrl }), {
+            status: 200, headers: { 'Content-Type': 'application/json' },
+          });
+        } catch (err: any) {
+          return new Response(JSON.stringify({
+            error: `Failed to start tunnel: ${err.message}`,
+          }), { status: 500, headers: { 'Content-Type': 'application/json' } });
+        }
       }
 
       // Refs endpoint — auth required, does NOT reset idle timer
@@ -1225,9 +1698,10 @@ async function start() {
         }
         try {
           // Sync active tab from Chrome extension — detects manual tab switches
-          const activeUrl = url.searchParams.get('activeUrl');
-          if (activeUrl) {
-            browserManager.syncActiveTabByUrl(activeUrl);
+          const rawActiveUrl = url.searchParams.get('activeUrl');
+          const sanitizedActiveUrl = sanitizeExtensionUrl(rawActiveUrl);
+          if (sanitizedActiveUrl) {
+            browserManager.syncActiveTabByUrl(sanitizedActiveUrl);
           }
           const tabs = await browserManager.getTabListWithTitles();
           return new Response(JSON.stringify({ tabs }), {
@@ -1296,11 +1770,12 @@ async function start() {
         // The Chrome extension sends the active tab's URL — prefer it over
         // Playwright's page.url() which can be stale in headed mode when
         // the user navigates manually.
-        const extensionUrl = body.activeTabUrl || null;
+        const rawExtensionUrl = body.activeTabUrl || null;
+        const sanitizedExtUrl = sanitizeExtensionUrl(rawExtensionUrl);
         // Sync active tab BEFORE reading the ID — the user may have switched
         // tabs manually and the server's activeTabId is stale.
-        if (extensionUrl) {
-          browserManager.syncActiveTabByUrl(extensionUrl);
+        if (sanitizedExtUrl) {
+          browserManager.syncActiveTabByUrl(sanitizedExtUrl);
         }
         const msgTabId = browserManager?.getActiveTabId?.() ?? 0;
         const ts = new Date().toISOString();
@@ -1310,12 +1785,12 @@ async function start() {
         // Per-tab agent: each tab can run its own agent concurrently
         const tabState = getTabAgent(msgTabId);
         if (tabState.status === 'idle') {
-          spawnClaude(msg, extensionUrl, msgTabId);
+          spawnClaude(msg, sanitizedExtUrl, msgTabId);
           return new Response(JSON.stringify({ ok: true, processing: true }), {
             status: 200, headers: { 'Content-Type': 'application/json' },
           });
         } else if (tabState.queue.length < MAX_QUEUE) {
-          tabState.queue.push({ message: msg, ts, extensionUrl });
+          tabState.queue.push({ message: msg, ts, extensionUrl: sanitizedExtUrl });
           return new Response(JSON.stringify({ ok: true, queued: true, position: tabState.queue.length }), {
             status: 200, headers: { 'Content-Type': 'application/json' },
           });
@@ -1346,7 +1821,8 @@ async function start() {
         if (!validateAuth(req)) {
           return new Response(JSON.stringify({ error: 'Unauthorized' }), { status: 401, headers: { 'Content-Type': 'application/json' } });
         }
-        killAgent();
+        const killBody = await req.json().catch(() => ({}));
+        killAgent(killBody.tabId ?? null);
         addChatEntry({ ts: new Date().toISOString(), role: 'agent', type: 'agent_error', error: 'Killed by user' });
         // Process next in queue
         if (messageQueue.length > 0) {
@@ -1361,7 +1837,8 @@ async function start() {
         if (!validateAuth(req)) {
           return new Response(JSON.stringify({ error: 'Unauthorized' }), { status: 401, headers: { 'Content-Type': 'application/json' } });
         }
-        killAgent();
+        const stopBody = await req.json().catch(() => ({}));
+        killAgent(stopBody.tabId ?? null);
         addChatEntry({ ts: new Date().toISOString(), role: 'agent', type: 'agent_error', error: 'Stopped by user' });
         return new Response(JSON.stringify({ ok: true, queuedMessages: messageQueue.length }), {
           status: 200, headers: { 'Content-Type': 'application/json' },
@@ -1461,7 +1938,115 @@ async function start() {
         return new Response(JSON.stringify({ ok: true }), { status: 200, headers: { 'Content-Type': 'application/json' } });
       }
 
-      // ─── Auth-required endpoints ──────────────────────────────────
+      // ─── Batch endpoint — N commands, 1 HTTP round-trip ─────────────
+      // Accepts both root AND scoped tokens (same as /command).
+      // Executes commands sequentially through the full security pipeline.
+      // Designed for remote agents where tunnel latency dominates.
+      if (url.pathname === '/batch' && req.method === 'POST') {
+        const tokenInfo = getTokenInfo(req);
+        if (!tokenInfo) {
+          return new Response(JSON.stringify({ error: 'Unauthorized' }), {
+            status: 401,
+            headers: { 'Content-Type': 'application/json' },
+          });
+        }
+        resetIdleTimer();
+        const body = await req.json();
+        const { commands } = body;
+
+        if (!Array.isArray(commands) || commands.length === 0) {
+          return new Response(JSON.stringify({ error: '"commands" must be a non-empty array' }), {
+            status: 400,
+            headers: { 'Content-Type': 'application/json' },
+          });
+        }
+        if (commands.length > 50) {
+          return new Response(JSON.stringify({ error: 'Max 50 commands per batch' }), {
+            status: 400,
+            headers: { 'Content-Type': 'application/json' },
+          });
+        }
+
+        const startTime = Date.now();
+        emitActivity({
+          type: 'command_start',
+          command: 'batch',
+          args: [`${commands.length} commands`],
+          url: browserManager.getCurrentUrl(),
+          tabs: browserManager.getTabCount(),
+          mode: browserManager.getConnectionMode(),
+          clientId: tokenInfo?.clientId,
+        });
+
+        const results: Array<{ index: number; status: number; result: string; command: string; tabId?: number }> = [];
+        for (let i = 0; i < commands.length; i++) {
+          const cmd = commands[i];
+          if (!cmd || typeof cmd.command !== 'string') {
+            results.push({ index: i, status: 400, result: JSON.stringify({ error: 'Missing "command" field' }), command: '' });
+            continue;
+          }
+          // Reject nested batches
+          if (cmd.command === 'batch') {
+            results.push({ index: i, status: 400, result: JSON.stringify({ error: 'Nested batch commands are not allowed' }), command: 'batch' });
+            continue;
+          }
+          const cr = await handleCommandInternal(
+            { command: cmd.command, args: cmd.args, tabId: cmd.tabId },
+            tokenInfo,
+            { skipRateCheck: true, skipActivity: true },
+          );
+          results.push({
+            index: i,
+            status: cr.status,
+            result: cr.result,
+            command: cmd.command,
+            tabId: cmd.tabId,
+          });
+        }
+
+        const duration = Date.now() - startTime;
+        emitActivity({
+          type: 'command_end',
+          command: 'batch',
+          args: [`${commands.length} commands`],
+          url: browserManager.getCurrentUrl(),
+          duration,
+          status: 'ok',
+          result: `${results.filter(r => r.status === 200).length}/${commands.length} succeeded`,
+          tabs: browserManager.getTabCount(),
+          mode: browserManager.getConnectionMode(),
+          clientId: tokenInfo?.clientId,
+        });
+
+        return new Response(JSON.stringify({
+          results,
+          duration,
+          total: commands.length,
+          succeeded: results.filter(r => r.status === 200).length,
+          failed: results.filter(r => r.status !== 200).length,
+        }), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        });
+      }
+
+      // ─── Command endpoint (accepts both root AND scoped tokens) ────
+      // Must be checked BEFORE the blanket root-only auth gate below,
+      // because scoped tokens from /connect are valid for /command.
+      if (url.pathname === '/command' && req.method === 'POST') {
+        const tokenInfo = getTokenInfo(req);
+        if (!tokenInfo) {
+          return new Response(JSON.stringify({ error: 'Unauthorized' }), {
+            status: 401,
+            headers: { 'Content-Type': 'application/json' },
+          });
+        }
+        resetIdleTimer();
+        const body = await req.json();
+        return handleCommand(body, tokenInfo);
+      }
+
+      // ─── Auth-required endpoints (root token only) ─────────────────
 
       if (!validateAuth(req)) {
         return new Response(JSON.stringify({ error: 'Unauthorized' }), {
@@ -1621,223 +2206,6 @@ async function start() {
         });
       }
 
-      // ─── Batch endpoint ───────────────────────────────────────────
-      //
-      // Execute multiple commands in parallel across tabs.
-      // Commands targeting different tabs run concurrently (Promise.allSettled).
-      // Commands targeting the same tab run sequentially within that tab group.
-      //
-      //   POST /batch
-      //   { commands: [{command, args?, tabId?}, ...], timeout?, stream? }
-      //
-      if (url.pathname === '/batch' && req.method === 'POST') {
-        resetIdleTimer();
-        try {
-          const body = await req.json();
-          const { commands, timeout = 30000, stream = false } = body;
-
-          if (!Array.isArray(commands) || commands.length === 0) {
-            return new Response(JSON.stringify({ error: 'commands must be a non-empty array' }), {
-              status: 400, headers: { 'Content-Type': 'application/json' },
-            });
-          }
-          if (commands.length > 50) {
-            return new Response(JSON.stringify({ error: 'Max 50 commands per batch' }), {
-              status: 400, headers: { 'Content-Type': 'application/json' },
-            });
-          }
-
-          // Batch-safe command subset
-          const BATCH_SAFE = new Set([
-            // READ
-            'text', 'html', 'links', 'snapshot', 'accessibility', 'cookies', 'url',
-            // WRITE
-            'goto', 'click', 'fill', 'select', 'hover', 'scroll', 'wait',
-            // META
-            'screenshot', 'pdf',
-            // Special (handled separately)
-            'newtab', 'closetab',
-          ]);
-
-          // Validate all commands before execution
-          for (let i = 0; i < commands.length; i++) {
-            const cmd = commands[i];
-            if (!cmd.command) {
-              return new Response(JSON.stringify({ error: `commands[${i}]: missing "command" field` }), {
-                status: 400, headers: { 'Content-Type': 'application/json' },
-              });
-            }
-            if (!BATCH_SAFE.has(cmd.command)) {
-              return new Response(JSON.stringify({
-                error: `commands[${i}]: "${cmd.command}" is not batch-safe`,
-                hint: `Batch-safe commands: ${[...BATCH_SAFE].sort().join(', ')}`,
-              }), {
-                status: 400, headers: { 'Content-Type': 'application/json' },
-              });
-            }
-            if (cmd.command !== 'newtab' && (cmd.tabId === undefined || cmd.tabId === null)) {
-              return new Response(JSON.stringify({ error: `commands[${i}]: tabId required for batch commands (except newtab)` }), {
-                status: 400, headers: { 'Content-Type': 'application/json' },
-              });
-            }
-          }
-
-          emitActivity({ type: 'command_start', command: 'batch', args: [`${commands.length} commands`], url: browserManager.getCurrentUrl(), tabs: browserManager.getTabCount(), mode: browserManager.getConnectionMode() });
-          const batchStart = Date.now();
-
-          // Execute a single command on a TabSession
-          async function executeBatchCommand(cmd: any, cmdTimeout: number): Promise<{ ok: boolean; result?: string; error?: string; tabId?: number }> {
-            const startTime = Date.now();
-            try {
-              // Special: newtab
-              if (cmd.command === 'newtab') {
-                const newId = await browserManager.newTab(cmd.args?.[0]);
-                return { ok: true, result: `Tab ${newId} created`, tabId: newId };
-              }
-              // Special: closetab (skip activeTabId update per plan decision 1B)
-              if (cmd.command === 'closetab') {
-                const session = browserManager.getSession(cmd.tabId);
-                const page = session.getPage();
-                await page.close();
-                // pages and tabSessions cleanup happens via page.on('close') handler
-                return { ok: true, result: `Tab ${cmd.tabId} closed` };
-              }
-
-              const session = browserManager.getSession(cmd.tabId);
-              let result: string;
-
-              if (READ_COMMANDS.has(cmd.command)) {
-                result = await handleReadCommand(cmd.command, cmd.args || [], session);
-              } else if (WRITE_COMMANDS.has(cmd.command)) {
-                result = await handleWriteCommand(cmd.command, cmd.args || [], session, browserManager);
-              } else if (cmd.command === 'snapshot') {
-                result = await handleSnapshot(cmd.args || [], session);
-              } else if (cmd.command === 'screenshot') {
-                const screenshotPath = cmd.args?.[0] || `/tmp/browse-batch-${cmd.tabId}-${Date.now()}.png`;
-                await session.getPage().screenshot({ path: screenshotPath, fullPage: true });
-                result = `Screenshot saved: ${screenshotPath}`;
-              } else if (cmd.command === 'pdf') {
-                const pdfPath = cmd.args?.[0] || `/tmp/browse-batch-${cmd.tabId}-${Date.now()}.pdf`;
-                await session.getPage().pdf({ path: pdfPath });
-                result = `PDF saved: ${pdfPath}`;
-              } else {
-                return { ok: false, error: `Unknown batch command: ${cmd.command}` };
-              }
-
-              return { ok: true, result };
-            } catch (err: any) {
-              return { ok: false, error: friendlyErrorMessage(err.message || String(err)) };
-            }
-          }
-
-          // Group commands by tabId (newtab commands are their own group)
-          const tabGroups = new Map<number | 'newtab', Array<{ cmd: any; index: number }>>();
-          for (let i = 0; i < commands.length; i++) {
-            const cmd = commands[i];
-            const key = cmd.command === 'newtab' ? 'newtab' : cmd.tabId;
-            if (!tabGroups.has(key)) tabGroups.set(key, []);
-            tabGroups.get(key)!.push({ cmd, index: i });
-          }
-
-          // Per-command timeout
-          const perCmdTimeout = Math.min(timeout, 10000);
-
-          // Results array (indexed by original command position)
-          const results: Array<{ index: number; tabId?: number; ok: boolean; result?: string; error?: string; elapsed_ms: number }> = [];
-
-          if (stream) {
-            // SSE streaming mode
-            const encoder = new TextEncoder();
-            const readableStream = new ReadableStream({
-              async start(controller) {
-                const emit = (event: string, data: any) => {
-                  try {
-                    controller.enqueue(encoder.encode(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`));
-                  } catch { /* client disconnected */ }
-                };
-
-                // Execute all tab groups in parallel
-                const groupPromises = [...tabGroups.entries()].map(async ([key, group]) => {
-                  // Sequential within each tab group
-                  for (const { cmd, index } of group) {
-                    const cmdStart = Date.now();
-                    const result = await executeBatchCommand(cmd, perCmdTimeout);
-                    const entry = { index, tabId: result.tabId ?? cmd.tabId, ...result, elapsed_ms: Date.now() - cmdStart };
-                    delete (entry as any).tabId; // clean up if undefined
-                    if (cmd.tabId !== undefined) (entry as any).tabId = result.tabId ?? cmd.tabId;
-                    emit('result', entry);
-                  }
-                });
-
-                await Promise.allSettled(groupPromises);
-
-                const total_ms = Date.now() - batchStart;
-                const succeeded = results.filter(r => r.ok).length; // won't work for stream, use inline count
-                emit('done', { total_ms, commands: commands.length });
-
-                try { controller.close(); } catch {}
-              },
-            });
-
-            emitActivity({ type: 'command_end', command: 'batch', args: [`${commands.length} commands`, 'stream'], url: browserManager.getCurrentUrl(), duration: Date.now() - batchStart, status: 'ok', tabs: browserManager.getTabCount(), mode: browserManager.getConnectionMode() });
-
-            return new Response(readableStream, {
-              headers: { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', 'Connection': 'keep-alive' },
-            });
-          } else {
-            // JSON response mode: execute all, collect results, return at once
-            const groupPromises = [...tabGroups.entries()].map(async ([key, group]) => {
-              for (const { cmd, index } of group) {
-                const cmdStart = Date.now();
-                const result = await executeBatchCommand(cmd, perCmdTimeout);
-                results.push({
-                  index,
-                  tabId: result.tabId ?? cmd.tabId,
-                  ok: result.ok,
-                  ...(result.result !== undefined ? { result: result.result } : {}),
-                  ...(result.error !== undefined ? { error: result.error } : {}),
-                  elapsed_ms: Date.now() - cmdStart,
-                });
-              }
-            });
-
-            // Batch-level timeout
-            await Promise.race([
-              Promise.allSettled(groupPromises),
-              new Promise<void>((resolve) => setTimeout(resolve, timeout)),
-            ]);
-
-            // Sort results by original command index
-            results.sort((a, b) => a.index - b.index);
-
-            const total_ms = Date.now() - batchStart;
-            const succeeded = results.filter(r => r.ok).length;
-            const failed = results.filter(r => !r.ok).length;
-
-            emitActivity({ type: 'command_end', command: 'batch', args: [`${commands.length} commands`], url: browserManager.getCurrentUrl(), duration: total_ms, status: failed > 0 ? 'error' : 'ok', tabs: browserManager.getTabCount(), mode: browserManager.getConnectionMode() });
-
-            return new Response(JSON.stringify({
-              results,
-              timing: { total_ms, succeeded, failed },
-            }), {
-              status: 200, headers: { 'Content-Type': 'application/json' },
-            });
-          }
-        } catch (err: any) {
-          return new Response(JSON.stringify({ error: err.message || 'Batch execution failed' }), {
-            status: 500, headers: { 'Content-Type': 'application/json' },
-          });
-        }
-      }
-
-      // ─── Command endpoint ──────────────────────────────────────────
-
-      if (url.pathname === '/command' && req.method === 'POST') {
-        resetIdleTimer();  // Only commands reset idle timer
-        const body = await req.json();
-        return handleCommand(body);
-      }
-
       return new Response('Not found', { status: 404 });
     },
   });
@@ -1897,6 +2265,51 @@ async function start() {
 
   // Initialize sidebar session (load existing or create new)
   initSidebarSession();
+
+  // ─── Tunnel startup (optional) ────────────────────────────────
+  // Start ngrok tunnel if BROWSE_TUNNEL=1 is set.
+  // Reads NGROK_AUTHTOKEN from env or ~/.gstack/ngrok.env.
+  // Reads NGROK_DOMAIN for dedicated domain (stable URL).
+  if (process.env.BROWSE_TUNNEL === '1') {
+    try {
+      // Read ngrok authtoken from env or config file
+      let authtoken = process.env.NGROK_AUTHTOKEN;
+      if (!authtoken) {
+        const ngrokEnvPath = path.join(process.env.HOME || '', '.gstack', 'ngrok.env');
+        if (fs.existsSync(ngrokEnvPath)) {
+          const envContent = fs.readFileSync(ngrokEnvPath, 'utf-8');
+          const match = envContent.match(/^NGROK_AUTHTOKEN=(.+)$/m);
+          if (match) authtoken = match[1].trim();
+        }
+      }
+      if (!authtoken) {
+        console.error('[browse] BROWSE_TUNNEL=1 but no NGROK_AUTHTOKEN found. Set it via env var or ~/.gstack/ngrok.env');
+      } else {
+        const ngrok = await import('@ngrok/ngrok');
+        const domain = process.env.NGROK_DOMAIN;
+        const forwardOpts: any = {
+          addr: port,
+          authtoken,
+        };
+        if (domain) forwardOpts.domain = domain;
+
+        tunnelListener = await ngrok.forward(forwardOpts);
+        tunnelUrl = tunnelListener.url();
+        tunnelActive = true;
+
+        console.log(`[browse] Tunnel active: ${tunnelUrl}`);
+
+        // Update state file with tunnel URL
+        const stateContent = JSON.parse(fs.readFileSync(config.stateFile, 'utf-8'));
+        stateContent.tunnel = { url: tunnelUrl, domain: domain || null, startedAt: new Date().toISOString() };
+        const tmpState = config.stateFile + '.tmp';
+        fs.writeFileSync(tmpState, JSON.stringify(stateContent, null, 2), { mode: 0o600 });
+        fs.renameSync(tmpState, config.stateFile);
+      }
+    } catch (err: any) {
+      console.error(`[browse] Failed to start tunnel: ${err.message}`);
+    }
+  }
 }
 
 start().catch((err) => {

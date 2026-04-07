@@ -132,7 +132,8 @@ function parseLine(line: string): ParsedNode | null {
  */
 export async function handleSnapshot(
   args: string[],
-  session: TabSession
+  session: TabSession,
+  securityOpts?: { splitForScoped?: boolean },
 ): Promise<string> {
   const opts = parseSnapshotArgs(args);
   const page = session.getPage();
@@ -348,11 +349,32 @@ export async function handleSnapshot(
   // ─── Annotated screenshot (-a) ────────────────────────────
   if (opts.annotate) {
     const screenshotPath = opts.outputPath || `${TEMP_DIR}/browse-annotated.png`;
-    // Validate output path (consistent with screenshot/pdf/responsive)
-    const resolvedPath = require('path').resolve(screenshotPath);
-    const safeDirs = [TEMP_DIR, process.cwd()];
-    if (!safeDirs.some((dir: string) => isPathWithin(resolvedPath, dir))) {
-      throw new Error(`Path must be within: ${safeDirs.join(', ')}`);
+    // Validate output path — resolve symlinks to prevent symlink traversal attacks
+    {
+      const nodePath = require('path') as typeof import('path');
+      const nodeFs = require('fs') as typeof import('fs');
+      const absolute = nodePath.resolve(screenshotPath);
+      const safeDirs = [TEMP_DIR, process.cwd()].map((d: string) => {
+        try { return nodeFs.realpathSync(d); } catch { return d; }
+      });
+      let realPath: string;
+      try {
+        realPath = nodeFs.realpathSync(absolute);
+      } catch (err: any) {
+        if (err.code === 'ENOENT') {
+          try {
+            const dir = nodeFs.realpathSync(nodePath.dirname(absolute));
+            realPath = nodePath.join(dir, nodePath.basename(absolute));
+          } catch {
+            realPath = absolute;
+          }
+        } else {
+          throw new Error(`Cannot resolve real path: ${screenshotPath} (${err.code})`);
+        }
+      }
+      if (!safeDirs.some((dir: string) => isPathWithin(realPath, dir))) {
+        throw new Error(`Path must be within: ${safeDirs.join(', ')}`);
+      }
     }
     try {
       // Inject overlay divs at each ref's bounding box
@@ -436,6 +458,38 @@ export async function handleSnapshot(
   if (inFrame) {
     const frameUrl = session.getFrame()?.url() ?? 'unknown';
     output.unshift(`[Context: iframe src="${frameUrl}"]`);
+  }
+
+  // Split output for scoped tokens: trusted refs + untrusted text
+  if (securityOpts?.splitForScoped) {
+    const trustedRefs: string[] = [];
+    const untrustedLines: string[] = [];
+
+    for (const line of output) {
+      // Lines starting with @ref are interactive elements (trusted metadata)
+      const refMatch = line.match(/^(\s*)@(e\d+|c\d+)\s+\[([^\]]+)\]\s*(.*)/);
+      if (refMatch) {
+        const [, indent, ref, role, rest] = refMatch;
+        // Truncate element name/content to 50 chars for trusted section
+        const nameMatch = rest.match(/^"(.+?)"/);
+        let truncName = nameMatch ? nameMatch[1] : rest.trim();
+        if (truncName.length > 50) truncName = truncName.slice(0, 47) + '...';
+        trustedRefs.push(`${indent}@${ref} [${role}] "${truncName}"`);
+      }
+      // All lines go to untrusted section (full content)
+      untrustedLines.push(line);
+    }
+
+    const parts: string[] = [];
+    if (trustedRefs.length > 0) {
+      parts.push('INTERACTIVE ELEMENTS (trusted — use these @refs for click/fill):');
+      parts.push(...trustedRefs);
+      parts.push('');
+    }
+    parts.push('═══ BEGIN UNTRUSTED WEB CONTENT ═══');
+    parts.push(...untrustedLines);
+    parts.push('═══ END UNTRUSTED WEB CONTENT ═══');
+    return parts.join('\n');
   }
 
   return output.join('\n');

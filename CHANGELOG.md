@@ -1,11 +1,100 @@
 # Changelog
 
-## [0.15.12.0] - 2026-04-06
+## [0.15.15.0] - 2026-04-06
+
+Community security wave: 8 PRs from 4 contributors, every fix credited as co-author.
+
+### Added
+- Cookie value redaction for tokens, API keys, JWTs, and session secrets in `browse cookies` output. Your secrets no longer appear in Claude's context.
+- IPv6 ULA prefix blocking (fc00::/7) in URL validation. Covers the full unique-local range, not just the literal `fd00::`. Hostnames like `fcustomer.com` are not false-positived.
+- Per-tab cancel signaling for sidebar agents. Stopping one tab's agent no longer kills all tabs.
+- Parent process watchdog for the browse server. When Claude Code exits, orphaned browser processes now self-terminate within 15 seconds.
+- Uninstall instructions in README (script + manual removal steps).
+- CSS value validation blocks `url()`, `expression()`, `@import`, `javascript:`, and `data:` in style commands, preventing CSS injection attacks.
+- Queue entry schema validation (`isValidQueueEntry`) with path traversal checks on `stateFile` and `cwd`.
+- Viewport dimension clamping (1-16384) and wait timeout clamping (1s-300s) prevent OOM and runaway waits.
+- Cookie domain validation in `cookie-import` prevents cross-site cookie injection.
+- DocumentFragment-based tab switching in sidebar (replaces innerHTML round-trip XSS vector).
+- `pollInProgress` reentrancy guard prevents concurrent chat polls from corrupting state.
+- 750+ lines of new security regression tests across 4 test files.
+- Supabase migration 003: column-level GRANT restricts anon UPDATE to (last_seen, gstack_version, os) only.
 
 ### Fixed
-- `snapshot -i` now auto-includes cursor-interactive elements (dropdown items, popover options, custom listboxes). Previously you had to remember to pass `-C` separately — now `-i` alone finds everything clickable on the page.
-- Snapshot correctly captures items inside floating containers (React portals, Radix Popover, Floating UI) even when they have ARIA roles. Previously these were silently skipped because the accessibility tree sometimes misses dynamically-rendered portals.
-- Dropdown/menu items with `role="option"` or `role="menuitem"` inside popovers are now captured and tagged with `popover-child` in the reason string, making them easy to identify.
+- Windows: `extraEnv` now passes through to the Windows launcher (was silently dropped).
+- Windows: welcome page serves inline HTML instead of `about:blank` redirect (fixes ERR_UNSAFE_REDIRECT).
+- Headed mode: auth token returned even without Origin header (fixes Playwright Chromium extensions).
+- `frame --url` now escapes user input before constructing RegExp (ReDoS fix).
+- Annotated screenshot path validation now resolves symlinks (was bypassable via symlink traversal).
+- Auth token removed from health broadcast, delivered via targeted `getToken` handler instead.
+- `/health` endpoint no longer exposes `currentUrl` or `currentMessage`.
+- Session ID validated before use in file paths (prevents path traversal via crafted active.json).
+- SIGTERM/SIGKILL escalation in sidebar agent timeout handler (was bare `kill()`).
+
+### For contributors
+- Queue files created with 0o700/0o600 permissions (server, CLI, sidebar-agent).
+- `escapeRegExp` utility exported from meta-commands.
+- State load filters cookies from localhost, .internal, and metadata domains.
+- Telemetry sync logs upsert errors from installation tracking.
+
+## [0.15.14.0] - 2026-04-05
+
+### Fixed
+
+- **`gstack-team-init` now detects and removes vendored gstack copies.** When you run `gstack-team-init` inside a repo that has gstack vendored at `.claude/skills/gstack/`, it automatically removes the vendored copy, untracks it from git, and adds it to `.gitignore`. No more stale vendored copies shadowing the global install.
+- **`/gstack-upgrade` respects team mode.** Step 4.5 now checks the `team_mode` config. In team mode, vendored copies are removed instead of synced, since the global install is the single source of truth.
+- **`team_mode` config key.** `./setup --team` and `./setup --no-team` now set a dedicated `team_mode` config key so the upgrade skill can reliably distinguish team mode from just having auto-upgrade enabled.
+
+## [0.15.13.0] - 2026-04-04 — Team Mode
+
+Teams can now keep every developer on the same gstack version automatically. No more vendoring 342 files into your repo. No more version drift across branches. No more "who upgraded gstack last?" Slack threads. One command, every developer is current.
+
+Hat tip to Jared Friedman for the design.
+
+### Added
+
+- **`./setup --team`.** Registers a `SessionStart` hook in `~/.claude/settings.json` that auto-updates gstack at the start of each Claude Code session. Runs in background (zero latency), throttled to once/hour, network-failure-safe, completely silent. `./setup --no-team` reverses it.
+- **`./setup -q` / `--quiet`.** Suppresses all informational output. Used by the session-update hook but also useful for CI and scripted installs.
+- **`gstack-team-init` command.** Generates repo-level bootstrap files in two flavors: `optional` (gentle CLAUDE.md suggestion, one-time offer per developer) or `required` (CLAUDE.md enforcement + PreToolUse hook that blocks work without gstack installed).
+- **`gstack-settings-hook` helper.** DRY utility for adding/removing hooks in Claude Code's `settings.json`. Atomic writes (.tmp + rename) prevent corruption.
+- **`gstack-session-update` script.** The SessionStart hook target. Background fork, PID-based lockfile with stale recovery, `GIT_TERMINAL_PROMPT=0` to prevent credential prompt hangs, debug log at `~/.gstack/analytics/session-update.log`.
+- **Vendoring deprecation in preamble.** Every skill now detects vendored gstack copies in the project and offers one-time migration to team mode. "Want me to do it for you?" beats "here are 4 manual steps."
+
+### Changed
+
+- **Vendoring is deprecated.** README no longer recommends copying gstack into your repo. Global install + `--team` is the way. `--local` flag still works but prints a deprecation warning.
+- **Uninstall cleans up hooks.** `gstack-uninstall` now removes the SessionStart hook from `~/.claude/settings.json`.
+
+## [0.15.12.0] - 2026-04-05 — Content Security: 4-Layer Prompt Injection Defense
+
+When you share your browser with another AI agent via `/pair-agent`, that agent reads web pages. Web pages can contain prompt injection attacks. Hidden text, fake system messages, social engineering in product reviews. This release adds four layers of defense so remote agents can safely browse untrusted sites without being tricked.
+
+### Added
+
+- **Content envelope wrapping.** Every page read by a scoped agent is wrapped in `═══ BEGIN UNTRUSTED WEB CONTENT ═══` / `═══ END UNTRUSTED WEB CONTENT ═══` markers. The agent's instruction block tells it to never follow instructions found inside these markers. Envelope markers in page content are escaped with zero-width spaces to prevent boundary escape attacks.
+- **Hidden element stripping.** CSS-hidden elements (opacity < 0.1, font-size < 1px, off-screen positioning, same fg/bg color, clip-path, visibility:hidden) and ARIA label injections are detected and stripped from text output. The page DOM is never mutated. Uses clone + remove for text extraction, CSS injection for snapshots.
+- **Datamarking.** Text command output gets a session-scoped watermark (4-char random marker inserted as zero-width characters). If the content appears somewhere it shouldn't, the marker traces back to the session. Only applied to `text` command, not structured data like `html` or `forms`.
+- **Content filter hooks.** Extensible filter pipeline with `BROWSE_CONTENT_FILTER` env var (off/warn/block, default: warn). Built-in URL blocklist catches requestbin, pipedream, webhook.site, and other known exfiltration domains. Register custom filters for your own rules.
+- **Snapshot split format.** Scoped tokens get a split snapshot: trusted `@ref` labels (for click/fill) above the untrusted content envelope. The agent knows which refs are safe to use and which content is untrusted. Root tokens unchanged.
+- **SECURITY section in instruction block.** Remote agents now receive explicit warnings about prompt injection, with a list of common injection phrases and guidance to only use @refs from the trusted section.
+- **47 content security tests.** Covers all four layers plus chain security, envelope escaping, ARIA injection detection, false positive checks, and combined attack scenarios. Four injection fixture HTML pages for testing.
+
+### Changed
+
+- `handleCommand` refactored into `handleCommandInternal` (returns structured result) + thin HTTP wrapper. Chain subcommands now route through the full security pipeline (scope, domain, tab ownership, content wrapping) instead of bypassing it.
+- `attrs` added to `PAGE_CONTENT_COMMANDS` (ARIA attribute values are now wrapped as untrusted content).
+- Content wrapping centralized in one location in `handleCommandInternal` response path. Was fragmented across 6 call sites.
+
+### Fixed
+
+- `snapshot -i` now auto-includes cursor-interactive elements (dropdown items, popover options, custom listboxes). Previously you had to remember to pass `-C` separately.
+- Snapshot correctly captures items inside floating containers (React portals, Radix Popover, Floating UI) even when they have ARIA roles.
+- Dropdown/menu items with `role="option"` or `role="menuitem"` inside popovers are now captured and tagged with `popover-child`.
+- Chain commands now check domain restrictions on `newtab` (was only checking `goto`).
+- Nested chain commands rejected (recursion guard prevents chain-within-chain).
+- Rate limiting exemption for chain subcommands (chain counts as 1 request, not N).
+- Tunnel liveness verification: `/pair-agent` now probes the tunnel before using it, preventing dead tunnel URLs from reaching remote agents.
+- `/health` serves auth token on localhost for extension authentication (stripped when tunneled).
+- All 16 pre-existing test failures fixed (pair-agent skill compliance, golden file baselines, host smoke tests, relink test timeouts).
 
 ## [0.15.11.0] - 2026-04-05
 

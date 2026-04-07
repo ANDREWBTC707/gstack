@@ -15,7 +15,10 @@ import { TEMP_DIR, isPathWithin } from './platform';
 import { modifyStyle, undoModification, resetModifications, getModificationHistory } from './cdp-inspector';
 
 // Security: Path validation for screenshot output
-const SAFE_DIRECTORIES = [TEMP_DIR, process.cwd()];
+// Resolve safe directories through realpathSync to handle symlinks (e.g., macOS /tmp -> /private/tmp)
+const SAFE_DIRECTORIES = [TEMP_DIR, process.cwd()].map(d => {
+  try { return fs.realpathSync(d); } catch { return d; }
+});
 
 function validateOutputPath(filePath: string): void {
   const resolved = path.resolve(filePath);
@@ -328,7 +331,9 @@ export async function handleWriteCommand(
       const selector = args[0];
       if (!selector) throw new Error('Usage: browse wait <selector|--networkidle|--load|--domcontentloaded>');
       if (selector === '--networkidle') {
-        const timeout = args[1] ? parseInt(args[1], 10) : 15000;
+        const MAX_WAIT_MS = 300_000;
+        const MIN_WAIT_MS = 1_000;
+        const timeout = Math.min(Math.max(args[1] ? parseInt(args[1], 10) || MIN_WAIT_MS : 15000, MIN_WAIT_MS), MAX_WAIT_MS);
         await page.waitForLoadState('networkidle', { timeout });
         return 'Network idle';
       }
@@ -340,7 +345,9 @@ export async function handleWriteCommand(
         await page.waitForLoadState('domcontentloaded');
         return 'DOM content loaded';
       }
-      const timeout = args[1] ? parseInt(args[1], 10) : 15000;
+      const MAX_WAIT_MS = 300_000;
+      const MIN_WAIT_MS = 1_000;
+      const timeout = Math.min(Math.max(args[1] ? parseInt(args[1], 10) || MIN_WAIT_MS : 15000, MIN_WAIT_MS), MAX_WAIT_MS);
       const resolved = await session.resolveRef(selector);
       if ('locator' in resolved) {
         await resolved.locator.waitFor({ state: 'visible', timeout });
@@ -353,7 +360,9 @@ export async function handleWriteCommand(
     case 'viewport': {
       const size = args[0];
       if (!size || !size.includes('x')) throw new Error('Usage: browse viewport <WxH> (e.g., 375x812)');
-      const [w, h] = size.split('x').map(Number);
+      const [rawW, rawH] = size.split('x').map(Number);
+      const w = Math.min(Math.max(Math.round(rawW) || 1280, 1), 16384);
+      const h = Math.min(Math.max(Math.round(rawH) || 720, 1), 16384);
       await bm.setViewport(w, h);
       return `Viewport set to ${w}x${h}`;
     }
@@ -401,9 +410,19 @@ export async function handleWriteCommand(
       const [selector, ...filePaths] = args;
       if (!selector || filePaths.length === 0) throw new Error('Usage: browse upload <selector> <file1> [file2...]');
 
-      // Validate all files exist before upload
+      // Validate paths are within safe directories (same check as cookie-import)
       for (const fp of filePaths) {
         if (!fs.existsSync(fp)) throw new Error(`File not found: ${fp}`);
+        if (path.isAbsolute(fp)) {
+          let resolvedFp: string;
+          try { resolvedFp = fs.realpathSync(path.resolve(fp)); } catch { resolvedFp = path.resolve(fp); }
+          if (!SAFE_DIRECTORIES.some(dir => isPathWithin(resolvedFp, dir))) {
+            throw new Error(`Path must be within: ${SAFE_DIRECTORIES.join(', ')}`);
+          }
+        }
+        if (path.normalize(fp).includes('..')) {
+          throw new Error('Path traversal sequences (..) are not allowed');
+        }
       }
 
       const resolved = await session.resolveRef(selector);
@@ -461,7 +480,14 @@ export async function handleWriteCommand(
 
       for (const c of cookies) {
         if (!c.name || c.value === undefined) throw new Error('Each cookie must have "name" and "value" fields');
-        if (!c.domain) c.domain = defaultDomain;
+        if (!c.domain) {
+          c.domain = defaultDomain;
+        } else {
+          const cookieDomain = c.domain.startsWith('.') ? c.domain.slice(1) : c.domain;
+          if (cookieDomain !== defaultDomain && !defaultDomain.endsWith('.' + cookieDomain)) {
+            throw new Error(`Cookie domain "${c.domain}" does not match current page domain "${defaultDomain}". Use the target site first.`);
+          }
+        }
         if (!c.path) c.path = '/';
       }
 
@@ -481,6 +507,12 @@ export async function handleWriteCommand(
       if (domainIdx !== -1 && domainIdx + 1 < args.length) {
         // Direct import mode — no UI
         const domain = args[domainIdx + 1];
+        // Validate --domain against current page hostname to prevent cross-site cookie injection
+        const pageHostname = new URL(page.url()).hostname;
+        const normalizedDomain = domain.startsWith('.') ? domain.slice(1) : domain;
+        if (normalizedDomain !== pageHostname && !pageHostname.endsWith('.' + normalizedDomain)) {
+          throw new Error(`--domain "${domain}" does not match current page domain "${pageHostname}". Navigate to the target site first.`);
+        }
         const browser = browserArg || 'comet';
         const result = await importCookies(browser, [domain], profile);
         if (result.cookies.length > 0) {
@@ -528,6 +560,12 @@ export async function handleWriteCommand(
       // Validate CSS property name
       if (!/^[a-zA-Z-]+$/.test(property)) {
         throw new Error(`Invalid CSS property name: ${property}. Only letters and hyphens allowed.`);
+      }
+
+      // Validate CSS value — block data exfiltration patterns
+      const DANGEROUS_CSS = /url\s*\(|expression\s*\(|@import|javascript:|data:/i;
+      if (DANGEROUS_CSS.test(value)) {
+        throw new Error('CSS value rejected: contains potentially dangerous pattern.');
       }
 
       const mod = await modifyStyle(page, selector, property, value);
