@@ -269,7 +269,32 @@ export async function handleWriteCommand(
     }
 
     case 'scroll': {
-      const selector = args[0];
+      // Parse --times N and --wait ms flags
+      const timesIdx = args.indexOf('--times');
+      const times = timesIdx >= 0 ? parseInt(args[timesIdx + 1], 10) || 1 : 0;
+      const waitIdx = args.indexOf('--wait');
+      const waitMs = waitIdx >= 0 ? parseInt(args[waitIdx + 1], 10) || 1000 : 1000;
+      const selector = args.find(a => !a.startsWith('--') && args.indexOf(a) !== timesIdx + 1 && args.indexOf(a) !== waitIdx + 1);
+
+      if (times > 0) {
+        // Repeated scroll mode
+        for (let i = 0; i < times; i++) {
+          if (selector) {
+            const resolved = await bm.resolveRef(selector);
+            if ('locator' in resolved) {
+              await resolved.locator.scrollIntoViewIfNeeded({ timeout: 5000 });
+            } else {
+              await target.locator(resolved.selector).scrollIntoViewIfNeeded({ timeout: 5000 });
+            }
+          } else {
+            await target.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
+          }
+          if (i < times - 1) await new Promise(r => setTimeout(r, waitMs));
+        }
+        return `Scrolled ${times} times${selector ? ` (${selector})` : ''} with ${waitMs}ms delay`;
+      }
+
+      // Single scroll (original behavior)
       if (selector) {
         const resolved = await bm.resolveRef(selector);
         if ('locator' in resolved) {
