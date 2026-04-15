@@ -1,0 +1,12 @@
+{
+  "name": "security-only",
+  "description": "Security-focused gate: CSO audit with zero critical findings required.",
+  "failFast": true,
+  "steps": [
+    {
+      "skill": "cso",
+      "gate": "issues.filter(i => i.severity === 'critical').length === 0",
+      "timeout": 300
+    }
+  ]
+}

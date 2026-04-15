@@ -1,0 +1,23 @@
+{
+  "name": "pre-merge-gate",
+  "description": "Full pre-merge quality gate: code review → security audit → QA verification. All three must pass for the gate to open.",
+  "failFast": true,
+  "steps": [
+    {
+      "skill": "review",
+      "gate": "score >= 7 && issues.filter(i => i.severity === 'critical').length === 0",
+      "timeout": 180
+    },
+    {
+      "skill": "cso",
+      "gate": "issues.filter(i => i.severity === 'critical').length === 0",
+      "timeout": 240
+    },
+    {
+      "skill": "qa",
+      "gate": "verdict !== 'fail'",
+      "args": { "url": "$STAGING_URL" },
+      "timeout": 300
+    }
+  ]
+}
