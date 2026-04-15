@@ -169,8 +169,9 @@ export async function runSkillTest(options: {
   const promptFile = path.join(os.tmpdir(), `.prompt-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2)}`);
   fs.writeFileSync(promptFile, prompt);
 
-  const proc = Bun.spawn(['sh', '-c', `cat "${promptFile}" | claude ${args.map(a => `"${a}"`).join(' ')}`], {
+  const proc = Bun.spawn(['claude', ...args], {
     cwd: workingDirectory,
+    stdin: Bun.file(promptFile),
     stdout: 'pipe',
     stderr: 'pipe',
   });

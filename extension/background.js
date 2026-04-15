@@ -298,11 +298,20 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   }
 
   if (msg.type === 'getPort') {
-    sendResponse({ port: serverPort, connected: isConnected, token: authToken });
+    // Only include token for extension pages (sidepanel/popup), not content scripts.
+    // Content scripts have sender.tab set — blocking them prevents token exposure
+    // to arbitrary web pages where the content script is injected.
+    const token = sender.tab ? null : authToken;
+    sendResponse({ port: serverPort, connected: isConnected, token });
     return true;
   }
 
   if (msg.type === 'setPort') {
+    if (sender.tab) {
+      console.warn('[gstack] Rejected setPort from content script context');
+      sendResponse({ error: 'Not allowed from content scripts' });
+      return true;
+    }
     savePort(msg.port).then(() => {
       checkHealth();
       sendResponse({ ok: true });
@@ -414,8 +423,13 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     return;
   }
 
-  // Inspector: route alteration commands to content script
+  // Inspector: route alteration commands to content script (sidepanel only)
   if (msg.type === 'applyStyle' || msg.type === 'toggleClass' || msg.type === 'injectCSS' || msg.type === 'resetAll') {
+    if (sender.tab) {
+      console.warn('[gstack] Rejected inspector command from content script context');
+      sendResponse({ error: 'Not allowed from content scripts' });
+      return true;
+    }
     chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
       const tabId = tabs?.[0]?.id;
       if (!tabId) { sendResponse({ error: 'No active tab' }); return; }
@@ -424,14 +438,24 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     return true;
   }
 
-  // Sidebar → browse server command proxy
+  // Sidebar → browse server command proxy (extension pages only)
   if (msg.type === 'command') {
+    if (sender.tab) {
+      console.warn('[gstack] Rejected command from content script context');
+      sendResponse({ error: 'Not allowed from content scripts' });
+      return true;
+    }
     executeCommand(msg.command, msg.args).then(result => sendResponse(result));
     return true;
   }
 
-  // Sidebar → Claude Code (file-based message queue)
+  // Sidebar → Claude Code (file-based message queue, extension pages only)
   if (msg.type === 'sidebar-command') {
+    if (sender.tab) {
+      console.warn('[gstack] Rejected sidebar-command from content script context');
+      sendResponse({ error: 'Not allowed from content scripts' });
+      return true;
+    }
     const base = getBaseUrl();
     if (!base || !authToken) {
       sendResponse({ error: 'Not connected' });

@@ -1586,7 +1586,11 @@ tryConnect();
 
 // ─── Message Listener ───────────────────────────────────────────
 
-chrome.runtime.onMessage.addListener((msg) => {
+chrome.runtime.onMessage.addListener((msg, sender) => {
+  // Reject messages from content scripts — only trust background.js and
+  // other extension pages. Content scripts have sender.tab set.
+  if (sender.tab) return;
+
   if (msg.type === 'health') {
     if (msg.data) {
       const url = `http://127.0.0.1:${msg.data.port || 34567}`;
