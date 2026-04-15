@@ -1,0 +1,12 @@
+{
+  "name": "review-and-ship",
+  "description": "Quick review gate for low-risk changes. Review must score 6+ with no critical issues.",
+  "failFast": true,
+  "steps": [
+    {
+      "skill": "review",
+      "gate": "score >= 6 && issues.filter(i => i.severity === 'critical').length === 0",
+      "timeout": 120
+    }
+  ]
+}
