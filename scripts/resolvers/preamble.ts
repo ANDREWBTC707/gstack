@@ -98,7 +98,18 @@ if [ -d ".claude/skills/gstack" ] && [ ! -L ".claude/skills/gstack" ]; then
 fi
 echo "VENDORED_GSTACK: $_VENDORED"
 # Detect spawned session (OpenClaw or other orchestrator)
-[ -n "$OPENCLAW_SESSION" ] && echo "SPAWNED_SESSION: true" || true
+[ -n "$OPENCLAW_SESSION" ] && echo "SPAWNED_SESSION: true" || true${ctx.host === 'gbrain' || ctx.host === 'hermes' ? `
+# GBrain health check (gbrain/hermes host only)
+if command -v gbrain &>/dev/null; then
+  _BRAIN_JSON=$(gbrain doctor --fast --json 2>/dev/null || echo '{}')
+  _BRAIN_SCORE=$(echo "$_BRAIN_JSON" | grep -o '"health_score":[0-9]*' | cut -d: -f2)
+  _BRAIN_FAILS=$(echo "$_BRAIN_JSON" | grep -o '"status":"fail"' | wc -l | tr -d ' ')
+  _BRAIN_WARNS=$(echo "$_BRAIN_JSON" | grep -o '"status":"warn"' | wc -l | tr -d ' ')
+  echo "BRAIN_HEALTH: \${_BRAIN_SCORE:-unknown} (\${_BRAIN_FAILS:-0} failures, \${_BRAIN_WARNS:-0} warnings)"
+  if [ "\${_BRAIN_SCORE:-100}" -lt 50 ] 2>/dev/null; then
+    echo "$_BRAIN_JSON" | grep -o '"name":"[^"]*","status":"[^"]*","message":"[^"]*"' || true
+  fi
+fi` : ''}
 \`\`\``;
 }
 
@@ -268,6 +279,14 @@ touch ~/.gstack/.vendoring-warned-\${SLUG:-unknown}
 \`\`\`
 
 This only happens once per project. If the marker file exists, skip entirely.`;
+}
+
+function generateBrainHealthInstruction(ctx: TemplateContext): string {
+  if (ctx.host !== 'gbrain' && ctx.host !== 'hermes') return '';
+  return `If \`BRAIN_HEALTH\` is shown and the score is below 50, tell the user which checks
+failed (shown in the output) and suggest: "Run \\\`gbrain doctor\\\` for full diagnostics."
+If the output is not valid JSON or health_score is missing, treat GBrain as unavailable
+and proceed without brain features this session.`;
 }
 
 function generateSpawnedSessionCheck(): string {
@@ -745,6 +764,7 @@ export function generatePreamble(ctx: TemplateContext): string {
     generateRoutingInjection(ctx),
     generateVendoringDeprecation(ctx),
     generateSpawnedSessionCheck(),
+    generateBrainHealthInstruction(ctx),
     generateVoiceDirective(tier),
     ...(tier >= 2 ? [generateContextRecovery(ctx), generateAskUserFormat(ctx), generateCompletenessSection(), generateConfusionProtocol()] : []),
     ...(tier >= 3 ? [generateRepoModeSection(), generateSearchBeforeBuildingSection(ctx)] : []),
